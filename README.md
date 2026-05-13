@@ -4,6 +4,9 @@
 
 # Mini-SGLang
 
+> 本仓库是基于 [sgl-project/mini-sglang](https://github.com/sgl-project/mini-sglang) 的中文注释学习版本，主要用于理解 LLM serving 系统实现。
+> 原项目版权和许可证请见 [LICENSE](./LICENSE)。
+
 A **lightweight yet high-performance** inference framework for Large Language Models.
 
 ---

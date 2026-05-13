@@ -51,6 +51,28 @@ class GatedMLP(BaseOP):
 
 
 class MoEMLP(BaseOP):
+    #
+    # `MoEMLP` 是 MoE 模型里替代普通 dense MLP / FFN 的模块。
+    #
+    # 普通 MLP 是“所有 token 都经过同一个前馈网络”，而 MoE MLP 是：
+    # - 先用 `gate` 给每个 token 对所有 experts 打分
+    # - 根据 router 分数选择 top-k experts
+    # - 只让该 token 经过选中的 experts
+    # - 再按 router 权重把多个 expert 输出加权合并
+    #
+    # 本类只负责高层组织：
+    # - `self.gate`: router，线性层，形状逻辑是 hidden_size -> num_experts
+    # - `self.experts`: 真正的 expert MLP 集合，内部调用 MoE backend / kernel
+    #
+    # 一次 forward 的逻辑是：
+    #
+    #     hidden_states
+    #       -> gate(hidden_states) 得到 router_logits
+    #       -> experts.forward(hidden_states, router_logits)
+    #            -> top-k routing
+    #            -> expert MLP compute
+    #            -> weighted combine
+    #
     def __init__(self, config: ModelConfig):
         self.experts = MoELayer(
             num_experts=config.num_experts,
@@ -66,9 +88,16 @@ class MoEMLP(BaseOP):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # `hidden_states` is treated as a flat token batch: [num_tokens, hidden_dim].
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+
+        # Router logits: [num_tokens, num_experts].
+        # Each row scores how suitable every expert is for one token.
         router_logits = self.gate.forward(hidden_states)
+
+        # `MoELayer` uses router logits to pick top-k experts, run expert MLPs,
+        # and combine their outputs back into one hidden state per token.
         final_hidden_states = self.experts.forward(
             hidden_states=hidden_states, router_logits=router_logits
         )

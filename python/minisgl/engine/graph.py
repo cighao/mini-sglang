@@ -147,6 +147,8 @@ class GraphRunner:
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
+        # 目前只对 decode batch 复用 CUDA Graph，且 batch size 不能超过
+        # 已 capture 的最大图规模。prefill 的 shape 更动态，这里不走 graph。
         return batch.is_decode and batch.size <= self.max_graph_bs
 
     def replay(self, batch: Batch) -> torch.Tensor:
@@ -158,11 +160,34 @@ class GraphRunner:
         return self.buffer.logits[: batch.size]
 
     def pad_batch(self, batch: Batch) -> None:
+        # 如果当前 batch 可以走 CUDA Graph，就在真实请求后面补 `dummy_req`，
+        # 把 batch size 对齐到 `graph_bs_list` 中第一个 >= `batch.size` 的固定档位，
+        # 这样后续可以直接 replay 对应大小的已 capture graph。
+        #
+        # 例如：
+        # - graph_bs_list = [1, 2, 4, 8]
+        # - batch.size = 3
+        # 那么 padded_size = 4，后面会补 1 个 dummy request。
+        #
+        # 如果当前 batch 不能走 CUDA Graph（例如 prefill，或 batch 太大），
+        # 就保持原始 batch size，不额外 padding。
         padded_size = (  # choose the first available batch size
             next(bs for bs in self.graph_bs_list if bs >= batch.size)
             if self.can_use_cuda_graph(batch)
             else batch.size
         )
+        # `padded_reqs` 是执行时真正使用的请求列表：
+        # - 前 `batch.size` 个是真实请求
+        # - 后面补的是 `dummy_req`，仅用于占位，保证执行 shape 与
+        #   已 capture 的 CUDA Graph 一致
+        #
+        # 例子：
+        # - 原始 batch.reqs = [A, B, C]
+        # - padded_size = 4
+        # - 则 padded_reqs = [A, B, C, dummy_req]
+        #
+        # 后续构造输入 / 索引 / metadata 时会基于 `padded_reqs` 生成固定
+        # shape；而真正的业务结果仍然只关心前 `batch.size` 个真实请求。
         batch.padded_reqs = batch.reqs + [self.dummy_req] * (padded_size - batch.size)
 
     # NOTE: This must be called before freeing NCCL resources to prevent program hang

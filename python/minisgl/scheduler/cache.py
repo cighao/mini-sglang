@@ -43,13 +43,27 @@ class CacheManager:
         needed_pages = 0
         allocation_info: List[Tuple[int, int, int]] = []
         for req in reqs:
+            # 对于单个请求，只需要为“这轮新增进入 device 侧的部分”分配 page。
+            # - `cached_len` 之前的 token 已经有可复用的 KV 映射
+            # - `[cached_len, device_len)` 是这轮新增需要落到 KV Cache 的部分
+            #
+            # 由于底层按 page 管理，所以先把 token 边界换算成 page 边界。
             first_page = div_ceil(req.cached_len, self.page_size)
             last_page = div_ceil(req.device_len, self.page_size)
             if last_page > first_page:
+                # 记录这个请求需要新增多少页，以及后续应当把这些页写回
+                # `page_table` 的哪一行、哪个 page 区间。
                 needed_pages += last_page - first_page
                 allocation_info.append((req.table_idx, first_page, last_page))
         if needed_pages > 0:
+            # 为整批请求一次性分配所需 page：
+            # - `_allocate` 返回 page 起始位置
+            # - `_page_to_token` 再把每个 page 展开成具体 token 位置
+            #   （例如 page_size=4 时，page 起点 20 会展开为 [20, 21, 22, 23]）
             allocated = self._page_to_token(self._allocate(needed_pages))
+            # 把新分配的物理 KV 位置批量写回各请求对应的 `page_table` 行中，
+            # 这样后续 attention / kernel 就知道这些新增 token 的 KV 应该
+            # 去哪里读写。
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
@@ -130,17 +144,34 @@ def _write_page_table(
     allocation_info: List[Tuple[int, int, int]],
     page_size: int,
 ) -> None:
+    # `allocated` 是本轮新分配好的物理 KV 位置，已经按 token 粒度展开。
+    # 这里需要把它们按照 `allocation_info`，批量写回各请求对应的
+    # `page_table[table_idx, pos]`。
     needed_tokens = len(allocated)
+    # 先在 host 端构造两组一维索引：
+    # - `table_idx_host[i]` 表示第 i 个分配结果属于哪一行（哪个请求）
+    # - `positions_host[i]` 表示写入该行的哪个逻辑 token 位置
+    #
+    # 使用 pinned memory 便于后续异步搬运到 device。
     table_idx_host = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=True)
     positions_host = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=True)
     offset = 0
     for table_idx, first_page, last_page in allocation_info:
+        # `allocation_info` 按 page 记录区间，这里先换算成 token 区间。
+        # 例如 page_size = 4, first_page = 1, last_page = 3 时，
+        # 对应的逻辑位置区间就是 [4, 12)，也就是 token 位置 4~11。
         first_pos, last_pos = first_page * page_size, last_page * page_size
         length = last_pos - first_pos
+        # 这一段新分配的位置都属于同一个请求行 `table_idx`。
         table_idx_host[offset : offset + length].fill_(table_idx)
+        # 这一段在该请求行里写入连续的逻辑 token 位置。
         torch.arange(first_pos, last_pos, out=positions_host[offset : offset + length])
         offset += length
+    # 展开的目标写入位置数量必须与 `allocated` 的长度完全一致。
     assert offset == needed_tokens, "Mismatch in allocated tokens and filled tokens."
+    # 把 host 端构造好的二维高级索引搬到 device。
     table_idxs = table_idx_host.to(page_table.device, non_blocking=True)
     offsets = positions_host.to(page_table.device, non_blocking=True)
+    # 批量散写：
+    # page_table[table_idxs[i], offsets[i]] = allocated[i]
     page_table[table_idxs, offsets] = allocated

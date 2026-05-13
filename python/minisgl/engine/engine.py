@@ -190,6 +190,9 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        # 在这次 forward 执行期间，把当前 batch 绑定到全局 context 里。
+        # 代码块内部的模型逻辑可以通过 `get_global_ctx().batch` 访问它；
+        # 退出这个 with 后，会自动把 context 中的 `_batch` 恢复为 None。
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)

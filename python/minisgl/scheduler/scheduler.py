@@ -202,11 +202,41 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.cache_req(req, finished=True)
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        # 按执行后端的要求对 batch 做 padding。主要是让 decode batch 在需要时
+        # 对齐到已 capture 的 CUDA Graph batch size。
         self.engine.graph_runner.pad_batch(batch)
+        # 为这轮请求里新增进入 device 侧的 token 分配 KV page，并把对应的
+        # 物理位置写回 `page_table`。
         self.cache_manager.allocate_paged(batch.reqs)
+        # 为本轮真正参与前向计算的 token 生成位置编号，主要用于位置编码。
         batch.positions = _make_positions(batch, self.device)
+        # 构造本轮输入读取索引 `(table_idxs, positions)`，后续用它从
+        # `token_pool` 中取出这轮 forward 的 input ids。
         input_mapping = _make_input_tuple(batch, self.device)
+        # 构造本轮输出写回索引 `(table_idxs, write_positions)`，后续把
+        # 采样出的 next token 写回各请求在 `token_pool` 中的下一个位置。
         write_mapping = _make_write_tuple(batch, self.device)
+        # 根据 `input_mapping` 到 `page_table` 中查每个输入 token 对应的
+        # KV Cache 物理位置，并按这轮输入 token 的顺序拼成一个连续张量。
+        #
+        # 这里 `page_table` 存的是：
+        #
+        #   page_table[table_idx, pos] = physical_kv_index
+        #
+        # 而 `input_mapping` 等价于一组二维索引 `(table_idxs, positions)`，
+        # 表示“这轮 forward 需要读取哪些请求、哪些逻辑位置上的 token”。
+        # 因此这一句逻辑上等价于：
+        #
+        #   batch.out_loc = page_table[table_idxs, positions]
+        #
+        # 它得到的 `batch.out_loc[i]` 表示：本轮第 i 个输入 token 在
+        # KV Cache 中对应的物理位置。后续 attention / kernel 会据此
+        # 读写这批 token 的 KV。
+        #
+        # 例子：
+        # - 如果 `input_mapping` 等价于 `([7, 7, 3], [3, 4, 0])`
+        # - 且 `page_table[7,3] = 100`, `page_table[7,4] = 101`, `page_table[3,0] = 40`
+        # - 那么这一句得到的 `batch.out_loc` 就等价于 `[100, 101, 40]`
         batch.out_loc = self.engine.page_table[input_mapping]
         self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
@@ -234,11 +264,35 @@ class Scheduler(SchedulerIOMixin):
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
+    # 为本轮真正要参与前向计算的 token 构造位置编号，主要用于位置编码。
+    # 对单个请求来说，只需要为 `[cached_len, device_len)` 这一段生成位置：
+    # - `cached_len` 之前的前缀已经在 KV Cache 中，不需要重新计算
+    # - `[cached_len, device_len)` 是本轮新增要计算的 token
+    #
+    # 这里使用 `padded_reqs` 而不是 `reqs`，是为了在启用 CUDA Graph 时
+    # 让位置张量与实际执行使用的 padded batch shape 保持一致。
     needed_size = sum(r.extend_len for r in batch.padded_reqs)
     indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
+        # 为这个请求生成连续的位置区间：
+        #   [cached_len, cached_len + 1, ..., device_len - 1]
+        # 并顺序写入整批位置张量中，逻辑上等价于：
+        #
+        #   indices_host[offset : offset + length] =
+        #       torch.arange(req.cached_len, req.device_len)
+        #
+        # 例子：
+        # - 请求 A: cached_len = 3, device_len = 5 -> 写入 [3, 4]
+        # - 请求 B: cached_len = 0, device_len = 4 -> 写入 [0, 1, 2, 3]
+        #
+        # 如果 A 先写、B 后写，那么最终整批 positions 会是：
+        #
+        #   [3, 4, 0, 1, 2, 3]
+        #
+        # 后续这些位置会与 input_mapping 取出的输入 token 一一对应，
+        # 用于位置编码 / RoPE。
         torch.arange(
             req.cached_len,
             req.device_len,
@@ -246,22 +300,63 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
             out=indices_host[offset : offset + length],
         )
         offset += length
+    # pinned host memory -> device，便于后续异步搬运。
     return indices_host.to(device, non_blocking=True)
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
+    # 为 `token_pool` 构造本轮输入的二维索引 `(table_idxs, positions)`。
+    # 后续会用它直接取出：
+    #
+    #   token_pool[table_idxs, positions]
+    #
+    # 其中：
+    # - `table_idxs[i]` 表示第 i 个输入 token 属于哪个请求行
+    # - `positions[i]` 表示该 token 在该请求中的逻辑位置
+    #
+    # 例子：
+    # - 如果某轮有两个请求，分别对应：
+    #   table_idx=7, positions=[3, 4]
+    #   table_idx=3, positions=[0, 1, 2, 3]
+    # - 那么返回的二维索引等价于：
+    #   ([7, 7, 3, 3, 3, 3], [3, 4, 0, 1, 2, 3])
+    # - 后续取到的输入就是：
+    #   token_pool[7,3], token_pool[7,4], token_pool[3,0], ...
     mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
+        # 这个请求本轮有 `length` 个输入 token 要参与前向，它们都来自
+        # 同一个请求行 `req.table_idx`，所以把这一段全部填成相同的 table_idx。
         mapping_host[offset : offset + length].fill_(req.table_idx)
         offset += length
+    # 返回 `(table_idxs, positions)`，与 `batch.positions` 一一配对。
     return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
 
 
 def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
+    # 为本轮生成出的 next token 构造写回 `token_pool` 的二维索引
+    # `(table_idxs, write_positions)`。
+    # 后续会用它直接写入：
+    #
+    #   token_pool[table_idxs, write_positions] = next_tokens_gpu
+    #
+    # 对单个真实请求来说，写回位置通常是 `req.device_len`，即当前已存在
+    # token 之后的下一个槽位。
+    #
+    # 例子：
+    # - 如果两个请求分别对应：
+    #   table_idx=7, device_len=5
+    #   table_idx=3, device_len=2
+    # - 那么返回的二维索引等价于：
+    #   ([7, 3], [5, 2])
+    # - 后续写回效果就是：
+    #   token_pool[7,5] = next_token_of_req_7
+    #   token_pool[3,2] = next_token_of_req_3
     mapping_list = [req.table_idx for req in batch.reqs]
     mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
+    # 只有真实请求会产生输出 token，因此这里使用 `batch.reqs`，
+    # 不包含 padded 用的 dummy request。
     write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
     write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
     return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)

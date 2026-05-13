@@ -86,14 +86,26 @@ class ParallelLMHead(VocabParallelEmbedding):
 
     @nvtx_annotate("LMHead")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 计算当前 batch 每个请求用于采样的 logits。
+        # 这个函数先在 prefill 阶段从 `x` 中取出每个请求最后一个位置的 hidden state，
+        # 再与本 rank 持有的词表分片做线性映射；如果启用了 tensor parallel，
+        # 最后把各 rank 的局部 logits 拼回完整词表维度。
+        #
+        # 例子：prefill 时两个请求新增 token 数分别为 3 和 2，`x` 会包含这 5 个位置；
+        # 这里会只取每个请求的最后一个位置，最终输出 2 行 logits。
         ctx = get_global_ctx()
         batch = ctx.batch
         bs = batch.size
         if batch.is_prefill:
+            # prefill 只需要每个请求最后一个位置的 logits 用于下一 token 采样。
             indices = batch.attn_metadata.get_last_indices(bs)
             x = x[indices].contiguous()
             del indices
 
+        # `x` 是最后一个位置的 hidden state，形状可看作 `[bs, hidden_size]`；
+        # `module.weight` 是词表权重表，形状可看作 `[vocab_size_tp, hidden_size]`。
+        # 这里做一次线性映射，相当于让每个 hidden state 和当前 rank 负责的每个词向量分别打分，
+        # 得到该词表分片上的 logits，而不是概率；后续还需要在完整词表维度上做 softmax 才是概率分布。
         module = self.tied_embedding or self
         logits = F.linear(x, module.weight, self.bias)
         if self.tp_size == 1:
@@ -102,8 +114,15 @@ class ParallelLMHead(VocabParallelEmbedding):
         output_tensor = self._comm.all_gather(logits)
 
         if bs == 1:
+            # `all_gather` 后形状可看作 `[tp_size, vocab_size_tp]`，
+            # 这里直接展平成 `[1, tp_size * vocab_size_tp]`，把各 rank 的词表分片首尾拼起来。
+            # 末尾再裁到 `self.num_embeddings`，是因为按 TP 分片时可能做了向上取整，尾部会有补齐出来的无效位置。
             return output_tensor.view(1, -1)[:, : self.num_embeddings]
 
+        # `all_gather` 后形状可看作 `[bs * tp_size, vocab_size_tp]`；
+        # 这里先改成 `[tp_size, bs, vocab_size_tp]`，再转成 `[bs, tp_size, vocab_size_tp]`，
+        # 让同一个样本在不同 rank 上的词表分片排到一起，最后展平为 `[bs, tp_size * vocab_size_tp]`，
+        # 也就是每个样本对应一行完整词表 logits。末尾同样需要裁掉向上取整补出的无效位置。
         output_tensor = output_tensor.view((self.tp_size,) + input_shape)
         output_tensor = output_tensor.permute(1, 0, 2).contiguous()
         output_tensor = output_tensor.reshape(input_shape[:1] + (self.tp_size * input_shape[1],))

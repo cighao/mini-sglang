@@ -65,9 +65,19 @@ class FlashAttentionBackend(BaseAttnBackend):
         )
 
     def prepare_metadata(self, batch: Batch) -> None:
+        # 把当前 batch 整理成 FlashAttention 所需的 metadata：
+        # - `cu_seqlens_q / cu_seqlens_k` 描述变长 Q/K 的分段边界
+        # - `cache_seqlens` 描述每个请求当前可见的总长度
+        # - `page_table` 描述每个请求逻辑位置到物理 KV page 的映射
+        #
+        # 这里使用 `batch.padded_reqs`，是为了与实际执行时的 padded batch
+        # shape 保持一致，尤其是 decode + CUDA Graph 的场景。
         reqs = batch.padded_reqs
 
         padded_size = len(reqs)
+        # `seqlens_q` 是本轮真正新增参与计算的 query 长度；
+        # `seqlens_k` 是每个请求当前可见的总长度；
+        # `cached_lens` 用来区分 decode / 普通 prefill / 部分 cache hit prefill。
         seqlens_q = [req.extend_len for req in reqs]
         seqlens_k = [req.device_len for req in reqs]
         cached_lens = [req.cached_len for req in reqs]
@@ -81,19 +91,76 @@ class FlashAttentionBackend(BaseAttnBackend):
         cu_seqlens_k = torch.tensor([0] + seqlens_k, **CPU_KWARGS).cumsum_(dim=0)
         cu_seqlens_k = cu_seqlens_k.to(device, non_blocking=True)
 
+        # `cu_seqlens_q` 是 query 侧的 cumulative sequence lengths（前缀和），
+        # 用来描述每个请求的 query 在扁平化数组中的起止范围。
+        #
+        # 例子：
+        # - 如果每个请求的 query 长度分别是 [2, 3, 1]
+        # - 那么对应的前缀和就是 [0, 2, 5, 6]
+        # - 表示：
+        #   请求 0 的 query 范围是 [0, 2)
+        #   请求 1 的 query 范围是 [2, 5)
+        #   请求 2 的 query 范围是 [5, 6)
         if max_seqlen_q == 1:
+            # decode：每个请求这轮只计算 1 个 query，所以 q 的前缀和就是
+            # [0, 1, 2, ..., padded_size]。
             cu_seqlens_q = torch.arange(0, padded_size + 1, device=device, dtype=torch.int32)
         elif all(l == 0 for l in cached_lens):  # prefill with no cache hit
+            # 普通 prefill 且没有 cache hit：这时每个请求 q 长度等于 k 长度，
+            # 因此可以直接复用 `cu_seqlens_k`。
             cu_seqlens_q = cu_seqlens_k
         else:  # normal extend prefill, with partial cache hit
+            # 部分前缀命中 cache 的 prefill：这时 q 长度是 `extend_len`，
+            # k 长度是 `device_len`，两者不同，需要单独构造 `cu_seqlens_q`。
             cu_seqlens_q = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
             cu_seqlens_q = cu_seqlens_q.to(self.kvcache.device, non_blocking=True)
 
         page_table = get_global_ctx().page_table
+        # 全局 `page_table` 是按 token 粒度存储的：
+        #
+        #   page_table[table_idx, pos] = physical_token_index
+        #
+        # 也就是说，同一页中的每个 token 都各有一个条目。例如 `page_size = 4`
+        # 时，一页可能在某一行表现为：
+        #
+        #   [20, 21, 22, 23]
+        #
+        # 这里的 20/21/22/23 是这一页 4 个 token 对应的物理位置。
+        #
+        # 但 FlashAttention 这里想要的是 page 粒度映射，而不是把一页里的每个
+        # token 位置都传进去。所以这里分三步做：
+        #
+        # 1. 先取出 batch 中每个请求自己对应的那一行：
+        #
+        #      page_table[req.table_idx, ...]
+        #
+        # 2. 再按 `page_size` 做步长切片：
+        #
+        #      page_table[req.table_idx, : max_seqlen_k : self.page_size]
+        #
+        #    这等价于只取逻辑位置：
+        #
+        #      0, page_size, 2*page_size, ...
+        #
+        #    也就是每一页的起始 token 位置。
+        #
+        # 3. 最后把 batch 里每个请求取出的这一行 `stack` 成一个新的二维表，
+        #    作为当前 batch 专用的局部 `page_table`。
+        #
+        # 例子：
+        # - 如果 `page_size = 4`
+        # - 且某个请求这一行前 12 个位置是：
+        #   `[20,21,22,23, 40,41,42,43, 60,61,62,63]`
+        # - 那么：
+        #   `page_table[req.table_idx, :10:4]`
+        #   取到的是 `[20, 40, 60]`
+        # - 含义是：只保留第 0 页、第 1 页、第 2 页的起始 token 位置
         new_page_table = torch.stack(  # NOTE: global page table treat page_size = 1, we need slice
             [page_table[req.table_idx, : max_seqlen_k : self.page_size] for req in reqs]
         )
         if self.page_size > 1:
+            # 把每页起始的 token index 转成 page index，供 FlashAttention
+            # 按 page 粒度索引。
             new_page_table.div_(self.page_size, rounding_mode="floor")
         batch.attn_metadata = FAMetadata(
             cu_seqlens_k=cu_seqlens_k,
